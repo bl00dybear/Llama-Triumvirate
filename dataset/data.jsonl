@@ -1,0 +1,3 @@
+{"prompt": "Write a function to calculate factorial", "completion": "def factorial(n):\n    if n == 0 or n == 1:\n        return 1\n    return n * factorial(n - 1)"}
+{"prompt": "How do I reverse a string in Python?", "completion": "You can reverse a string using slicing: reversed_string = original_string[::-1]"}
+{"prompt": "Create a class for a simple bank account", "completion": "class BankAccount:\n    def __init__(self, balance=0):\n        self.balance = balance\n    \n    def deposit(self, amount):\n        self.balance += amount\n    \n    def withdraw(self, amount):\n        if amount <= self.balance:\n            self.balance -= amount\n            return True\n        return False"}
