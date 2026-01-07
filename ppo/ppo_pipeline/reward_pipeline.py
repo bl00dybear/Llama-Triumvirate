@@ -1,18 +1,19 @@
 import torch
-import torch.nn.functional as F
-from transformers import AutoModelForSequenceClassification,AutoTokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 class RewardPipeline:
     def __init__(self, model_name, device):
+        self.device = device
+        
+        print(f"Loading Reward Model: {model_name}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        self.device = device
-        self.model.to(device)
+        self.model.to(self.device)
         self.model.eval()
 
     def __call__(self, text):
-        input = self.tokenizer(
-            text,
+        inputs = self.tokenizer(
+            text, 
             return_tensors="pt", 
             truncation=True, 
             max_length=512,
@@ -20,11 +21,8 @@ class RewardPipeline:
         ).to(self.device)
         
         with torch.no_grad():
-            outputs = self.model(**input)
-            logits = outputs.logits
+            outputs = self.model(**inputs)
             
-            probs = F.softmax(logits, dim=-1)
+            score = outputs.logits[0].item()
             
-            score = probs[0][1].item()
-
         return score

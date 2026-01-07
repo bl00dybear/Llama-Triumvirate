@@ -3,20 +3,19 @@ import torch.nn.functional as F
 import math
 
 
-def compute_gae(rewards, values, next_value, gamma, lam, device):
-    gae = 0
-    returns = []
+def compute_gae(rewards, values, gamma, lam):
     advantages = []
-    values = values + [next_value]
-    mask = [1] * len(rewards)
+    gae = 0
     
-    for step in reversed(range(len(rewards))):
-        delta = rewards[step] + gamma * values[step + 1] * mask[step] - values[step]
-        gae = delta + gamma * lam * mask[step] * gae
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * values[t + 1] - values[t]
+        gae = delta + gamma * lam * gae
         advantages.insert(0, gae)
-        returns.insert(0, gae + values[step])
-        
-    return torch.tensor(advantages).to(device), torch.tensor(returns).to(device)
+    
+    returns = [adv + val for adv, val in zip(advantages, values[:-1])]
+    
+    return advantages, returns
+
 
 def get_log_probs(logits, labels):
     log_probs = F.log_softmax(logits, dim=-1)
@@ -24,16 +23,17 @@ def get_log_probs(logits, labels):
     return log_probs_labels.squeeze(-1)
 
 
-
-def train(model, dataloader, optimizer, reward_pipe, tokenizer, device, grad_accum_steps=4, epochs=3, max_grad_norm=1.0, scheduler=None, clip_range=0.2, gamma=0.99, lam=0.95, kl_coef=0.1):
-    model.train()
-
+def train(model, dataloader, optimizer, reward_pipe, tokenizer, device, grad_accum_steps=4, epochs=3, max_grad_norm=0.5, scheduler=None, clip_range=0.2, gamma=0.99, lam=0.95, kl_coef=0.05):
+    
     for epoch in range(epochs):
         print(f"\n{'='*60}\nEpoch {epoch + 1}/{epochs}\n{'='*60}")
 
-        epchs_loss_sum = 0.0
+        epoch_loss_sum = 0.0
+        epoch_policy_loss_sum = 0.0
+        epoch_value_loss_sum = 0.0
+        epoch_reward_sum = 0.0
+        epoch_kl_sum = 0.0
         steps_count = 0
-        optimizer.zero_grad()
 
         num_batches = len(dataloader)
 
@@ -44,102 +44,185 @@ def train(model, dataloader, optimizer, reward_pipe, tokenizer, device, grad_acc
             prompt_ids = prompt_inputs.input_ids
 
             try:
+                print(f"\n[Step {step}/{num_batches}] Generating...", end=" ", flush=True)
+                
+                model.eval()
                 with torch.no_grad():
                     gen_output = model.generate(
                         prompt_ids,
-                        max_new_tokens=32,
+                        attention_mask=prompt_inputs.attention_mask,
+                        max_new_tokens=16,
                         do_sample=True,
                         top_p=0.9,
                         pad_token_id=tokenizer.pad_token_id
                     )
+                    print("✓", flush=True)
 
+                    print(f"  Rewards...", end=" ", flush=True)
                     gen_text = tokenizer.batch_decode(gen_output, skip_special_tokens=True)
 
                     rewards = []
                     for text in gen_text:
                         rewards.append(reward_pipe(text))
-
+                    
+                    mean_reward = sum(rewards) / len(rewards)
+                    print(f"✓ {mean_reward:.4f}", flush=True)
 
                     attention_mask = (gen_output != tokenizer.pad_token_id).long()
-
-                    model.base_model.disable_adapter_layers()
-                    ref_logits, _ = model(gen_output, attention_mask)
-
-                    model.base_model.enable_adapter_layers()
-                    old_logits, old_values = model(gen_output, attention_mask)
-
                     shift_labels = gen_output[:, 1:].contiguous()
+                    batch_size = gen_output.shape[0]
+                    seq_len = gen_output.shape[1]
 
+                    print(f"  Ref model...", end=" ", flush=True)
+                    ref_logits, _ = model(gen_output, attention_mask, use_ref_model=True)
                     ref_shift_logits = ref_logits[:, :-1, :].contiguous()
+                    ref_log_probs = get_log_probs(ref_shift_logits, shift_labels)
+                    print("✓", flush=True)
 
-                    ref_log_probs = get_log_probs(ref_shift_logits, shift_labels).sum(dim=-1)
+                    print(f"  Old policy...", end=" ", flush=True)
+                    old_logits, old_values = model(gen_output, attention_mask, use_ref_model=False)
+                    old_shift_logits = old_logits[:, :-1, :].contiguous()
+                    old_log_probs = get_log_probs(old_shift_logits, shift_labels)
                     
-                    shift_logits = old_logits[..., :-1, :].contiguous()
-                    old_log_probs = get_log_probs(shift_logits, shift_labels).sum(dim=-1)
-                    
-                    kl_div = old_log_probs - ref_log_probs
-                    rewards_tensor = torch.tensor(rewards).to(device)
-                    non_score_reward = -kl_coef * kl_div
-                    total_rewards = non_score_reward.clone()
-                    total_rewards[-1] += rewards_tensor[-1] 
-                    
-                    next_value = old_values[-1].detach()
-                    advantages, returns = compute_gae(
-                        total_rewards.tolist(),
-                        old_values.detach().tolist(),
-                        next_value.item(),
-                        gamma, lam, device
-                    )
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    old_values_clone = old_values.clone()
+                    old_log_probs_clone = old_log_probs.clone()
+                    print("✓", flush=True)
 
-                logits, values = model(gen_output, attention_mask)
+                    kl_per_token = old_log_probs_clone - ref_log_probs
+                    mean_kl = kl_per_token.mean().item()
+                    
+                    all_advantages = []
+                    all_returns = []
+                    
+                    for i in range(batch_size):
+                        seq_values_list = old_values_clone[i].cpu().float().tolist()
+                        
+                        token_rewards = []
+                        for t in range(seq_len - 1):
+                            kl_penalty = -kl_coef * kl_per_token[i, t].item()
+                            token_rewards.append(kl_penalty)
+                        
+                        token_rewards[-1] += rewards[i]
+                        
+                        advantages, returns = compute_gae(token_rewards, seq_values_list, gamma, lam)
+                        
+                        all_advantages.append(torch.tensor(advantages, device=device, dtype=torch.float32))
+                        all_returns.append(torch.tensor(returns, device=device, dtype=torch.float32))
+                    
+                    advantages_tensor = torch.stack([torch.nn.functional.pad(adv, (0, seq_len - len(adv))) for adv in all_advantages])
+                    returns_tensor = torch.stack([torch.nn.functional.pad(ret, (0, seq_len - len(ret))) for ret in all_returns])
+                    
+                    adv_mean = advantages_tensor.mean()
+                    adv_std = advantages_tensor.std()
+                    advantages_tensor = (advantages_tensor - adv_mean) / (adv_std + 1e-8)
+                    advantages_tensor = torch.clamp(advantages_tensor, -10, 10)
+
+                model.train()
+                print(f"  Training...", end=" ", flush=True)
                 
-                new_shift_logits = logits[..., :-1, :].contiguous()
-                new_log_probs = get_log_probs(new_shift_logits, shift_labels).sum(dim=-1)
+                optimizer.zero_grad()
                 
-                ratio = torch.exp(new_log_probs - old_log_probs)
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
+                logits, values = model(gen_output, attention_mask, use_ref_model=False)
                 
+                shift_logits = logits[:, :-1, :].contiguous()
+                new_log_probs = get_log_probs(shift_logits, shift_labels)
+                
+                log_ratio = new_log_probs - old_log_probs_clone
+                log_ratio = torch.clamp(log_ratio, -10, 10)
+                ratio = torch.exp(log_ratio)
+                
+                surr1 = ratio * advantages_tensor[:, :seq_len-1]
+                surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages_tensor[:, :seq_len-1]
                 policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = F.mse_loss(values, returns)
                 
-                loss = (policy_loss + 0.5 * value_loss) / grad_accum_steps
+                value_loss = F.mse_loss(values.float(), returns_tensor.float())
+                value_loss = torch.clamp(value_loss, 0, 100)
+                
+                loss = policy_loss + 0.5 * value_loss
 
                 if not math.isfinite(loss.item()):
-                    optimizer.zero_grad(set_to_none=True)
+                    print(f"\n  ⚠️  Non-finite: loss={loss.item()}, policy={policy_loss.item()}, value={value_loss.item()}")
+                    optimizer.zero_grad()
+                    continue
+                
+                if not math.isfinite(policy_loss.item()):
+                    print(f"\n  ⚠️  Non-finite policy loss")
+                    optimizer.zero_grad()
+                    continue
+                    
+                if not math.isfinite(value_loss.item()):
+                    print(f"\n  ⚠️  Non-finite value loss")
+                    optimizer.zero_grad()
                     continue
 
                 loss.backward()
-
-
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print("[WARN] CUDA OOM on batch")
-                    exit(1)
-
-            if step % grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(
+                
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     max_grad_norm,
                 )
+                
+                if not math.isfinite(grad_norm):
+                    print(f"\n  ⚠️  Non-finite gradients")
+                    optimizer.zero_grad()
+                    continue
+                
                 optimizer.step()
-
+                
                 if scheduler is not None:
                     scheduler.step()
-                    
-                optimizer.zero_grad(set_to_none=True)
+                
+                print("✓", flush=True)
 
-            with torch.no_grad():
-                step_loss = float(loss.detach() * grad_accum_steps)
+                step_loss = float(loss.detach())
+                step_policy_loss = float(policy_loss.detach())
+                step_value_loss = float(value_loss.detach())
+                
                 epoch_loss_sum += step_loss
+                epoch_policy_loss_sum += step_policy_loss
+                epoch_value_loss_sum += step_value_loss
+                epoch_reward_sum += mean_reward
+                epoch_kl_sum += mean_kl
                 steps_count += 1
 
-            avg_loss = epoch_loss_sum / max(1, steps_count)
-            print(f"Step [{step}/{num_batches}] - Loss: {step_loss:.4f} - Avg Loss: {avg_loss:.4f}")
+                print(f"  Loss: {step_loss:.4f} | Policy: {step_policy_loss:.4f} | Value: {step_value_loss:.4f} | KL: {mean_kl:.4f} | Grad: {grad_norm:.4f}")
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print("\n[WARN] CUDA OOM")
+                    torch.cuda.empty_cache()
+                    optimizer.zero_grad()
+                    continue
+                print(f"\n[ERROR] {str(e)}")
+                import traceback
+                traceback.print_exc()
+                optimizer.zero_grad()
+                continue
+
+            if step % 10 == 0:
+                avg_loss = epoch_loss_sum / max(1, steps_count)
+                avg_reward = epoch_reward_sum / max(1, steps_count)
+                avg_kl = epoch_kl_sum / max(1, steps_count)
+                print(f"\n{'='*60}")
+                print(f"  Step {step}/{num_batches} Summary:")
+                print(f"    Avg Loss:   {avg_loss:.4f}")
+                print(f"    Avg Reward: {avg_reward:.4f}")
+                print(f"    Avg KL:     {avg_kl:.4f}")
+                print(f"{'='*60}\n")
 
         avg_epoch_loss = epoch_loss_sum / max(1, steps_count)
+        avg_epoch_policy_loss = epoch_policy_loss_sum / max(1, steps_count)
+        avg_epoch_value_loss = epoch_value_loss_sum / max(1, steps_count)
+        avg_epoch_reward = epoch_reward_sum / max(1, steps_count)
+        avg_epoch_kl = epoch_kl_sum / max(1, steps_count)
 
-        print(f"\nEpoch {epoch + 1} completed - Average Loss: {avg_epoch_loss:.4f}")
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch + 1} Completed:")
+        print(f"  Total Loss:   {avg_epoch_loss:.4f}")
+        print(f"  Policy Loss:  {avg_epoch_policy_loss:.4f}")
+        print(f"  Value Loss:   {avg_epoch_value_loss:.4f}")
+        print(f"  Mean Reward:  {avg_epoch_reward:.4f}")
+        print(f"  Mean KL Div:  {avg_epoch_kl:.4f}")
+        print(f"{'='*60}\n")
 
     return avg_epoch_loss

@@ -1,1 +1,6 @@
 .env
+ppo/ppo_pipeline/comp
+ppo/ppo_pipeline/unsloth_compiled_cache
+ppo/ppo_pipeline/final_ppo_model
+ppo/ppo_pipeline/__pycache__
+ppo/dataset
