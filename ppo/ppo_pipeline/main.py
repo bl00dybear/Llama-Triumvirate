@@ -1,5 +1,4 @@
 import torch
-
 from transformers import BitsAndBytesConfig, AutoTokenizer
 from peft import LoraConfig
 from torch.optim import AdamW
@@ -9,6 +8,7 @@ from torch.utils.data import DataLoader
 from model import PPOLlama3B
 from reward_pipeline import RewardPipeline
 from train_logic import train
+
 
 def main():
     print("=" * 60)
@@ -40,6 +40,7 @@ def main():
     print("\nLoading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     print("Tokenizer loaded")
 
     print("\nInitializing PPO model...")
@@ -48,7 +49,7 @@ def main():
 
     print("\nSetting up optimizer...")
     optimizer = AdamW(ppo_llama_model.parameters(), lr=1e-6)
-    print(f"Optimizer: AdamW (lr=1e-5)")
+    print("Optimizer: AdamW (lr=1e-6)")
 
     print("\nLoading dataset...")
     dataset = load_from_disk("/home/sebi/Llama-Triumvirate/ppo/dataset/hh_rlhf_local")

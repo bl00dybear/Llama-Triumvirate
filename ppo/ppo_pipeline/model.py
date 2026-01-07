@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-
 from transformers import AutoModelForCausalLM
 from peft import get_peft_model
+
 
 class PPOLlama3B(nn.Module):
     def __init__(self, model_name, bnb_config, lora_config):
@@ -16,11 +16,6 @@ class PPOLlama3B(nn.Module):
         )
         
         self.base_model = get_peft_model(base_model, lora_config)
-        
-        self.ref_model = self.base_model.get_base_model()
-        
-        for param in self.ref_model.parameters():
-            param.requires_grad = False
 
         self.value_head = nn.Linear(self.base_model.config.hidden_size, 1)
         nn.init.orthogonal_(self.value_head.weight, gain=0.01)
@@ -29,16 +24,9 @@ class PPOLlama3B(nn.Module):
 
     def forward(self, input_ids, attention_mask=None, use_ref_model=False):
         if use_ref_model:
-            with torch.no_grad():
-                outputs = self.ref_model(
-                    input_ids, 
-                    attention_mask=attention_mask, 
-                    output_hidden_states=True
-                )
-                logits = outputs.logits
-                last_hidden_state = outputs.hidden_states[-1]
-                values = self.value_head(last_hidden_state.float()).squeeze(-1)
-        else:
+            self.base_model.disable_adapter_layers()
+        
+        with torch.no_grad() if use_ref_model else torch.enable_grad():
             outputs = self.base_model(
                 input_ids, 
                 attention_mask=attention_mask, 
@@ -47,6 +35,9 @@ class PPOLlama3B(nn.Module):
             logits = outputs.logits
             last_hidden_state = outputs.hidden_states[-1]
             values = self.value_head(last_hidden_state.float()).squeeze(-1)
+        
+        if use_ref_model:
+            self.base_model.enable_adapter_layers()
         
         return logits, values
 
