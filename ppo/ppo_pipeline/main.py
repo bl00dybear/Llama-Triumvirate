@@ -52,17 +52,24 @@ def main():
     print("Optimizer: AdamW (lr=1e-6)")
 
     print("\nLoading dataset...")
-    dataset = load_from_disk("/home/sebi/Llama-Triumvirate/ppo/dataset/hh_rlhf_local")
-    dataset["train"] = dataset["train"].select(range(1000))
+    dataset = load_from_disk("/home/sebi/Llama-Triumvirate/ppo/dataset/harmful_dataset")
+    # dataset["train"] = dataset["train"].select(range(1000))
     print(f"Dataset loaded: {len(dataset['train'])} training samples")
 
     print("\nCreating dataloader...")
+    # dataloader = DataLoader(
+    #     dataset["train"],
+    #     batch_size=batch_size,
+    #     shuffle=True,
+    #     collate_fn=lambda batch: [item["chosen"].split("Assistant:")[0] + "Assistant:" for item in batch]
+    # )
     dataloader = DataLoader(
         dataset["train"],
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=lambda batch: [item["chosen"].split("Assistant:")[0] + "Assistant:" for item in batch]
+        collate_fn=lambda batch: [item["prompt"] for item in batch]
     )
+
     print(f"Dataloader created: {len(dataloader)} batches")
     
     print("\nInitializing reward pipeline...")
@@ -80,7 +87,7 @@ def main():
         reward_pipe=reward_pipeline,
         tokenizer=tokenizer,
         device=ppo_llama_model.base_model.device,
-        grad_accum_steps=4,
+        grad_accum_steps=2,
         epochs=1
     )
 

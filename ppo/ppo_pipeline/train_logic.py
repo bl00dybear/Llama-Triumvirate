@@ -44,7 +44,7 @@ def train(
     gamma: float = 0.99, 
     lam: float = 0.95, 
     kl_coef: float = 0.05,
-    value_loss_coef: float = 0.5,
+    value_loss_coef: float = 0.1,
     adv_clip_range: float = 10.0,
     log_ratio_clip_range: float = 10.0
 ) -> float:
@@ -79,7 +79,7 @@ def train(
                     gen_output = model.generate(
                         prompt_ids,
                         attention_mask=prompt_inputs.attention_mask,
-                        max_new_tokens=16,
+                        max_new_tokens=128,
                         do_sample=True,
                         top_p=0.9,
                         pad_token_id=tokenizer.pad_token_id
@@ -88,13 +88,21 @@ def train(
 
                     print(f"  Rewards...", end=" ", flush=True)
                     gen_text = tokenizer.batch_decode(gen_output, skip_special_tokens=True)
+                    
+                    # Printam textul pentru debug vizual
+                    print(f"\n  [Gen Text]: {gen_text[0]}")
 
                     rewards = reward_pipe(gen_text)
                     if not isinstance(rewards, list):
                         rewards = [rewards]
                     
                     mean_reward = sum(rewards) / len(rewards)
-                    print(f"Done {mean_reward:.4f}", flush=True)
+                    
+                    rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
+                    if rewards_tensor.shape[0] > 1:
+                        rewards_tensor = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
+                    
+                    print(f"Done (Raw: {mean_reward:.4f})", flush=True)
 
                     attention_mask = (gen_output != tokenizer.pad_token_id).long()
                     shift_labels = gen_output[:, 1:].contiguous()
@@ -138,7 +146,9 @@ def train(
                         # this step is named reward shaping and what it does is that splits the reward 
                         # between all generated tokens
                         generated_start_idx = max(0, seq_len - generated_length - 1)
-                        reward_per_token = rewards[i] / max(1, generated_length)
+                        
+                        reward_per_token = rewards_tensor[i].item() / max(1, generated_length)
+                        
                         for t in range(generated_start_idx, seq_len - 1):
                             token_rewards[t] += reward_per_token
                         
@@ -172,7 +182,7 @@ def train(
                 surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages_tensor
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
-                value_loss = F.mse_loss(values.float(), returns_tensor.float())
+                value_loss = F.mse_loss(values[:, :-1].float(), returns_tensor.float())
                 value_loss = torch.clamp(value_loss, 0, 100)
                 
                 loss = (policy_loss + value_loss_coef * value_loss) / grad_accum_steps
