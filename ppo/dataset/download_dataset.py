@@ -3,8 +3,8 @@ import os
 
 
 def main():
-    dataset_name = "Anthropic/hh-rlhf"
-    save_path = "./hh_rlhf_local"
+    dataset_name = "LLM-LAT/harmful-dataset"
+    save_path = "./harmful_dataset"
 
     print(f"Downloading: {dataset_name}...")
 

@@ -11,19 +11,14 @@ from train_logic import train
 
 
 def main():
-    print("=" * 60)
-    print("PPO Training Pipeline - Starting")
-    print("=" * 60)
-    
     model_name = "huihui-ai/Llama-3.2-3B-Instruct-abliterated"
-    print(f"\nModel: {model_name}")
+    print(f"\n[INFO] Model: {model_name}")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.float16
     )
-    print("Quantization: 4-bit NF4")
 
     lora_config = LoraConfig(
         r=16,
@@ -32,31 +27,27 @@ def main():
         bias="none",
         task_type="CAUSAL_LM"
     )
-    print(f"LoRA Config: r={lora_config.r}, alpha={lora_config.lora_alpha}, dropout={lora_config.lora_dropout}")
+    print(f"[INFO] LoRA Config: r={lora_config.r}, alpha={lora_config.lora_alpha}, dropout={lora_config.lora_dropout}")
 
-    batch_size = 4
-    print(f"Batch size: {batch_size}")
+    batch_size = 3
+    print(f"[INFO] Batch size: {batch_size}")
 
-    print("\nLoading tokenizer...")
+    print("\n[INFO] Loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-    print("Tokenizer loaded")
 
-    print("\nInitializing PPO model...")
+    print("\n[INFO] Initializing PPO model")
     ppo_llama_model = PPOLlama3B(model_name, bnb_config, lora_config)
-    print("Model initialized")
 
-    print("\nSetting up optimizer...")
-    optimizer = AdamW(ppo_llama_model.parameters(), lr=1e-6)
-    print("Optimizer: AdamW (lr=1e-6)")
+    optimizer = AdamW(ppo_llama_model.parameters(), lr=1.41e-5)
 
-    print("\nLoading dataset...")
+    print("\n[INFO] Loading dataset")
     dataset = load_from_disk("/home/sebi/Llama-Triumvirate/ppo/dataset/harmful_dataset")
     # dataset["train"] = dataset["train"].select(range(1000))
-    print(f"Dataset loaded: {len(dataset['train'])} training samples")
+    print(f"[INFO] Training samples: {len(dataset['train'])}")
 
-    print("\nCreating dataloader...")
+    print("\n[INFO] Creating dataloader")
     # dataloader = DataLoader(
     #     dataset["train"],
     #     batch_size=batch_size,
@@ -70,15 +61,10 @@ def main():
         collate_fn=lambda batch: [item["prompt"] for item in batch]
     )
 
-    print(f"Dataloader created: {len(dataloader)} batches")
+    print(f"[INFO] Batches num {len(dataloader)} batches")
     
-    print("\nInitializing reward pipeline...")
+    print("\n[INFO] Initializing reward pipeline")
     reward_pipeline = RewardPipeline("OpenAssistant/reward-model-deberta-v3-large-v2", device=torch.device("cuda"))
-    print("Reward pipeline initialized")
-
-    print("\n" + "=" * 60)
-    print("Starting training...")
-    print("=" * 60)
     
     train(
         model=ppo_llama_model,
@@ -87,17 +73,16 @@ def main():
         reward_pipe=reward_pipeline,
         tokenizer=tokenizer,
         device=ppo_llama_model.base_model.device,
-        grad_accum_steps=2,
-        epochs=1
+        grad_accum_steps=10,
+        epochs=4,
+        kl_coef=0.02,
+        value_loss_coef=0.1
     )
 
-    print("\n" + "=" * 60)
-    print("Saving model...")
+    print("\n[INFO] Saving model...")
     ppo_llama_model.base_model.save_pretrained("./final_ppo_model")
-    print("Model saved to: ./final_ppo_model")
-    print("=" * 60)
-    print("Training completed successfully!")
-    print("=" * 60)
+    print("[INFO] Model saved to: ./final_ppo_model")
+    print("[INFO] Training completed successfully")
 
 
 if __name__ == "__main__":

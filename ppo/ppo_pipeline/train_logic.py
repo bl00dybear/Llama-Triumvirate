@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 import math
+import os
+import matplotlib.pyplot as plt
 from typing import List, Tuple
 
 
@@ -46,10 +48,23 @@ def train(
     kl_coef: float = 0.05,
     value_loss_coef: float = 0.1,
     adv_clip_range: float = 10.0,
-    log_ratio_clip_range: float = 10.0
+    log_ratio_clip_range: float = 10.0,
+    checkpoint_dir: str = "./checkpoints",
+    save_steps: int = 50
 ) -> float:
     
     # L_total = L_policy + c1*L_value - c2*L_entropy
+    
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        temp_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_in_progress")
+        os.makedirs(temp_checkpoint_path, exist_ok=True)
+
+    history_rewards = []
+    history_kl = []
+    history_loss = []
+    history_steps = []
+    global_step_counter = 0
 
     for epoch in range(epochs):
         print(f"\n{'='*60}\nEpoch {epoch + 1}/{epochs}\n{'='*60}")
@@ -72,7 +87,7 @@ def train(
             prompt_length = prompt_ids.shape[1]
 
             try:
-                print(f"\n[Step {step}/{num_batches}] Generating...", end=" ", flush=True)
+                # print(f"\n[Step {step}/{num_batches}] Generating...", end=" ", flush=True)
                 
                 model.eval()
                 with torch.no_grad():
@@ -84,13 +99,13 @@ def train(
                         top_p=0.9,
                         pad_token_id=tokenizer.pad_token_id
                     )
-                    print("Done", flush=True)
+                    # print("Done", flush=True)
 
-                    print(f"  Rewards...", end=" ", flush=True)
+                    # print(f"  Rewards...", end=" ", flush=True)
                     gen_text = tokenizer.batch_decode(gen_output, skip_special_tokens=True)
                     
                     # Printam textul pentru debug vizual
-                    print(f"\n  [Gen Text]: {gen_text[0]}")
+                    # print(f"\n  [Gen Text]: {gen_text[0]}")
 
                     rewards = reward_pipe(gen_text)
                     if not isinstance(rewards, list):
@@ -102,7 +117,7 @@ def train(
                     if rewards_tensor.shape[0] > 1:
                         rewards_tensor = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
                     
-                    print(f"Done (Raw: {mean_reward:.4f})", flush=True)
+                    # print(f"Done (Raw: {mean_reward:.4f})", flush=True)
 
                     attention_mask = (gen_output != tokenizer.pad_token_id).long()
                     shift_labels = gen_output[:, 1:].contiguous()
@@ -110,20 +125,20 @@ def train(
                     seq_len = gen_output.shape[1]
                     generated_length = seq_len - prompt_length
 
-                    print(f"  Ref model...", end=" ", flush=True)
+                    # print(f"  Ref model...", end=" ", flush=True)
                     ref_logits, _ = model(gen_output, attention_mask, use_ref_model=True)
                     ref_shift_logits = ref_logits[:, :-1, :].contiguous()
                     ref_log_probs = get_log_probs(ref_shift_logits, shift_labels)
-                    print("Done", flush=True)
+                    # print("Done", flush=True)
 
-                    print(f"  Old policy...", end=" ", flush=True)
+                    # print(f"  Old policy...", end=" ", flush=True)
                     old_logits, old_values = model(gen_output, attention_mask, use_ref_model=False)
                     old_shift_logits = old_logits[:, :-1, :].contiguous()
                     old_log_probs = get_log_probs(old_shift_logits, shift_labels)
                     
                     old_values_clone = old_values.clone()
                     old_log_probs_clone = old_log_probs.clone()
-                    print("Done", flush=True)
+                    # print("Done", flush=True)
 
                     # kl_val = log(pi_theta(a_t))-log(pi_ref(a_t))
                     # in other words here we compute the diff between base_weight and the model that is 
@@ -167,7 +182,7 @@ def train(
                     advantages_tensor = torch.clamp(advantages_tensor, -adv_clip_range, adv_clip_range)
 
                 model.train()
-                print(f"  Training...", end=" ", flush=True)
+                # print(f"  Training...", end=" ", flush=True)
                 
                 logits, values = model(gen_output, attention_mask, use_ref_model=False)
                 
@@ -222,10 +237,10 @@ def train(
                     
                     optimizer.zero_grad()
                     
-                    print("Done", flush=True)
+                    # print("Done", flush=True)
                 else:
                     grad_norm = 0.0
-                    print("Accumulated", flush=True)
+                    # print("Accumulated", flush=True)
 
                 step_loss = float(loss.detach() * grad_accum_steps)
                 step_policy_loss = float(policy_loss.detach())
@@ -237,8 +252,15 @@ def train(
                 epoch_reward_sum += mean_reward
                 epoch_kl_sum += mean_kl
                 steps_count += 1
+                
+                global_step_counter += 1
+                history_rewards.append(mean_reward)
+                history_kl.append(mean_kl)
+                history_loss.append(step_loss)
+                history_steps.append(global_step_counter)
 
-                if step % grad_accum_steps == 0:
+                if step % grad_accum_steps == 0 and step%10 != 0:
+                    print(f"[Step:{step}/{num_batches}]", end="")
                     print(f"  Loss: {step_loss:.4f} | Policy: {step_policy_loss:.4f} | Value: {step_value_loss:.4f} | KL: {mean_kl:.4f} | Grad: {grad_norm:.4f}")
 
             except RuntimeError as e:
@@ -253,16 +275,56 @@ def train(
                 optimizer.zero_grad()
                 continue
 
+            if checkpoint_dir and step % save_steps == 0:
+                print(f"  [Checkpoint] Saving progress at step {step}/{num_batches}...", end=" ", flush=True)
+                model.base_model.save_pretrained(temp_checkpoint_path)
+                value_head_path = os.path.join(temp_checkpoint_path, "value_head.pt")
+                torch.save(model.value_head.state_dict(), value_head_path)
+                
+                try:
+                    plt.figure(figsize=(10, 12))
+                    
+                    plt.subplot(3, 1, 1)
+                    plt.plot(history_steps, history_rewards, label='Mean Reward', color='green')
+                    plt.title('Training Rewards (Higher is better)')
+                    plt.xlabel('Steps')
+                    plt.ylabel('Reward')
+                    plt.grid(True, alpha=0.3)
+                    plt.legend()
+
+                    plt.subplot(3, 1, 2)
+                    plt.plot(history_steps, history_kl, label='KL Divergence', color='orange')
+                    plt.title('KL Divergence (Should be stable)')
+                    plt.xlabel('Steps')
+                    plt.ylabel('KL')
+                    plt.grid(True, alpha=0.3)
+                    plt.legend()
+
+                    plt.subplot(3, 1, 3)
+                    plt.plot(history_steps, history_loss, label='Total Loss', color='blue')
+                    plt.title('Training Loss')
+                    plt.xlabel('Steps')
+                    plt.ylabel('Loss')
+                    plt.grid(True, alpha=0.3)
+                    plt.legend()
+
+                    plt.tight_layout()
+                    plot_path = os.path.join(temp_checkpoint_path, "training_progress.pdf")
+                    plt.savefig(plot_path)
+                    plt.close()
+                except Exception as e:
+                    print(f"Error plotting: {e}")
+                
+                print("Done")
+
             if step % 10 == 0:
                 avg_loss = epoch_loss_sum / max(1, steps_count)
                 avg_reward = epoch_reward_sum / max(1, steps_count)
                 avg_kl = epoch_kl_sum / max(1, steps_count)
-                print(f"\n{'='*60}")
-                print(f"  Step {step}/{num_batches} Summary:")
+                print(f"[Step {step}/{num_batches}]:")
                 print(f"    Avg Loss:   {avg_loss:.4f}")
                 print(f"    Avg Reward: {avg_reward:.4f}")
                 print(f"    Avg KL:     {avg_kl:.4f}")
-                print(f"{'='*60}\n")
 
         avg_epoch_loss = epoch_loss_sum / max(1, steps_count)
         avg_epoch_policy_loss = epoch_policy_loss_sum / max(1, steps_count)
@@ -278,5 +340,38 @@ def train(
         print(f"  Mean Reward:  {avg_epoch_reward:.4f}")
         print(f"  Mean KL Div:  {avg_epoch_kl:.4f}")
         print(f"{'='*60}\n")
+
+        if checkpoint_dir:
+            epoch_checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}")
+            print(f"Saving epoch checkpoint to {epoch_checkpoint_path}...")
+            model.base_model.save_pretrained(epoch_checkpoint_path)
+            value_head_path = os.path.join(epoch_checkpoint_path, "value_head.pt")
+            torch.save(model.value_head.state_dict(), value_head_path)
+            
+            try:
+                plt.figure(figsize=(10, 12))
+                plt.subplot(3, 1, 1)
+                plt.plot(history_steps, history_rewards, label='Mean Reward', color='green')
+                plt.title('Training Rewards')
+                plt.grid(True, alpha=0.3)
+                
+                plt.subplot(3, 1, 2)
+                plt.plot(history_steps, history_kl, label='KL Divergence', color='orange')
+                plt.title('KL Divergence')
+                plt.grid(True, alpha=0.3)
+                
+                plt.subplot(3, 1, 3)
+                plt.plot(history_steps, history_loss, label='Total Loss', color='blue')
+                plt.title('Training Loss')
+                plt.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plot_path = os.path.join(epoch_checkpoint_path, "training_progress_epoch.pdf")
+                plt.savefig(plot_path)
+                plt.close()
+            except Exception as e:
+                print(f"Error plotting at epoch end: {e}")
+
+            print(f"Epoch checkpoint saved successfully!\n")
 
     return avg_epoch_loss

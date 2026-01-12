@@ -6,7 +6,7 @@ class RewardPipeline:
     def __init__(self, model_name, device):
         self.device = device
         
-        print(f"Loading Reward Model: {model_name}...")
+        print(f"[INFO] Loading Reward Model: {model_name}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
         self.model.to(self.device)
