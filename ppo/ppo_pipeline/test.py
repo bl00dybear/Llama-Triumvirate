@@ -4,7 +4,7 @@ from peft import PeftModel
 import torch
 
 base_model_name = "huihui-ai/Llama-3.2-3B-Instruct-abliterated"
-adapter_path = "/home/sebi/Llama-Triumvirate/ppo/ppo_pipeline/final_ppo_model"
+adapter_path = "/home/sebi/Llama-Triumvirate/ppo/ppo_pipeline/checkpoints/checkpoint_in_progress"
 max_seq_length = 1024
 dtype = None
 load_in_4bit = True
